@@ -221,6 +221,11 @@ func (proxy *ProxyHttpServer) dial(ctx *ProxyCtx, network, addr string) (c net.C
 }
 
 func (proxy *ProxyHttpServer) connectDial(ctx *ProxyCtx, network, addr string) (c net.Conn, err error) {
+	// Multi-hop upstream chain takes precedence when attached; otherwise the
+	// legacy ConnectDialWithReq/ConnectDial/dial path is used unchanged.
+	if proxy.upstreamDialer != nil {
+		return proxy.upstreamDialer.DialContextForRequest(ctx.Req.Context(), ctx.Req, network, addr)
+	}
 	if proxy.ConnectDialWithReq == nil && proxy.ConnectDial == nil {
 		return proxy.dial(ctx, network, addr)
 	}

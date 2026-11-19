@@ -48,6 +48,11 @@ func (ctx *ProxyCtx) RoundTrip(req *http.Request) (*http.Response, error) {
 	if ctx.RoundTripper != nil {
 		return ctx.RoundTripper.RoundTrip(req, ctx)
 	}
+	// Multi-hop upstream chain takes precedence when attached; otherwise the
+	// legacy single-hop transport is used with identical behavior.
+	if ctx.Proxy.upstreamRT != nil {
+		return ctx.Proxy.upstreamRT.RoundTrip(req)
+	}
 	return ctx.Proxy.Tr.RoundTrip(req)
 }
 

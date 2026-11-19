@@ -72,6 +72,13 @@ type ProxyHttpServer struct {
 	// h2Server is the HTTP/2 server instance used for MITM.
 	// It is shared across all connections.
 	h2Server *http2.Server
+
+	// upstreamRT / upstreamDialer are the optional multi-hop upstream-chain
+	// integration, installed via SetUpstreamRouter (subpackage upstream). Both
+	// are nil by default; all request paths then use the legacy single-hop
+	// behavior unchanged.
+	upstreamRT     upstreamChainRoundTripper
+	upstreamDialer upstreamChainDialer
 }
 
 func hasPort(s string) bool {

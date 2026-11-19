@@ -8,6 +8,10 @@ import (
 )
 
 func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request) {
+	// Attach the per-request TLS report collection box before any handler
+	// runs, so upstream verification outcomes are observable to response
+	// handlers.
+	r = r.WithContext(withReportBox(r.Context()))
 	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), Proxy: proxy}
 
 	ctx.Logf("Got request %v %v %v %v", r.URL.Path, r.Host, r.Method, r.URL.String())

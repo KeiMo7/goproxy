@@ -6,7 +6,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 
+	"github.com/elazarl/goproxy/internal/upstreamtls"
 	"golang.org/x/net/http2"
 )
 
@@ -69,6 +71,42 @@ type ProxyHttpServer struct {
 	// Accept-Encoding header. To disable this behavior, set
 	// Tr.DisableCompression to true.
 	KeepAcceptEncoding bool
+
+	// trustReg holds the per-target upstream trust policy. It is lazily
+	// initialized to an empty registry, which leaves default verification
+	// strength unchanged (system trust for every target).
+	trustReg  *upstreamtls.Registry
+	trustOnce sync.Once
+	// policyPool keeps one http.Transport (and therefore one connection
+	// cache) per distinct effective trust policy, preventing connections
+	// built under different trust configurations from being reused across
+	// targets.
+	policyPool    *policyTransportPool
+	transportOnce sync.Once
+	// policyRT is the default round tripper: it selects a per-policy
+	// transport for each request so TLS verification follows the target's
+	// own trust configuration.
+	policyRT         *policyRoundTripper
+	roundTripperOnce sync.Once
+	// RoundTripperOverride, when non-nil, replaces the default round
+	// tripper for every request while still letting an override delegate
+	// back through DefaultRoundTrip. It is mainly useful for observing
+	// structured upstream failures without changing the proxy's behavior.
+	RoundTripperOverride RoundTripper
+	// relayRT owns requests tunneled through an encrypted upstream proxy,
+	// where two independent TLS hops cannot be expressed via
+	// http.Transport's DialTLSContext hook.
+	relayRT        *relayRoundTripper
+	relayRoundOnce sync.Once
+	// legacySkipTargets narrows the pre-existing
+	// Tr.TLSClientConfig.InsecureSkipVerify switch: when that switch is on,
+	// verification is bypassed only for targets listed here, and each
+	// bypass is recorded in the per-request UpstreamTLSReport. An empty
+	// list with the switch on preserves the old blanket behavior for
+	// backward compatibility, again with every bypass recorded.
+	legacySkipTargets map[upstreamtls.NormalizedName]struct{}
+	legacySkipMu      sync.RWMutex
+
 	// h2Server is the HTTP/2 server instance used for MITM.
 	// It is shared across all connections.
 	h2Server *http2.Server

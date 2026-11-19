@@ -48,7 +48,30 @@ func (ctx *ProxyCtx) RoundTrip(req *http.Request) (*http.Response, error) {
 	if ctx.RoundTripper != nil {
 		return ctx.RoundTripper.RoundTrip(req, ctx)
 	}
-	return ctx.Proxy.Tr.RoundTrip(req)
+	if ctx.Proxy.RoundTripperOverride != nil {
+		return ctx.Proxy.RoundTripperOverride.RoundTrip(req, ctx)
+	}
+	// Route through the policy-aware round tripper so every upstream TLS
+	// hop is verified against the target's own registered trust policy with
+	// the target's own name. Plain HTTP requests take the original
+	// transport path unchanged inside that round tripper.
+	return ctx.Proxy.policyRoundTripper().RoundTrip(req)
+}
+
+// DefaultRoundTrip runs the proxy's built-in policy-aware round tripper,
+// bypassing any RoundTripperOverride. Overrides use it to delegate after
+// adding observation logic.
+func (proxy *ProxyHttpServer) DefaultRoundTrip(req *http.Request) (*http.Response, error) {
+	return proxy.policyRoundTripper().RoundTrip(req)
+}
+
+// policyRoundTripper lazily builds the single shared policy-aware round
+// tripper for this proxy.
+func (proxy *ProxyHttpServer) policyRoundTripper() *policyRoundTripper {
+	proxy.roundTripperOnce.Do(func() {
+		proxy.policyRT = &policyRoundTripper{proxy: proxy}
+	})
+	return proxy.policyRT
 }
 
 func (ctx *ProxyCtx) printf(msg string, argv ...any) {

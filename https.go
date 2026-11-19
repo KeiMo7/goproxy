@@ -20,6 +20,7 @@ import (
 
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
+	"github.com/elazarl/goproxy/internal/upstreamtls"
 	"golang.org/x/net/http2"
 )
 
@@ -595,6 +596,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					// see https://github.com/golang/go/issues/61596#issuecomment-1652345131
 					defer req.Body.Close()
 
+					// Carry the per-request TLS report box so target-hop
+					// verification outcomes remain observable in MITM mode.
+					req = req.WithContext(withReportBox(req.Context()))
+
 					// Bug fix which goproxy fails to provide request
 					// information URL in the context when does HTTPS MITM
 					ctx.Req = req
@@ -614,6 +619,11 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						}
 						resp, err = ctx.RoundTrip(req)
 						if err != nil {
+							// Record the structured failure on the context so
+							// handlers can classify and aggregate it, while
+							// keeping the existing client-facing behavior
+							// (connection tear-down / 502) unchanged.
+							ctx.Error = err
 							ctx.Warnf("Cannot read response from mitm'd server %v", err)
 							return false
 						}
@@ -855,14 +865,28 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxyWithHandler(
 		if !strings.ContainsRune(u.Host, ':') {
 			u.Host += ":443"
 		}
+		// Resolve the relay's own name and trust policy once, outside the
+		// per-connection closure. Every relay handshake uses the relay's
+		// host as SNI — never the target's, never a name left over from a
+		// previous connection — and verifies against the relay's own policy
+		// snapshot independently of the target hop inside the tunnel.
+		relayName, nameErr := upstreamtls.NormalizeName(u.Host)
+		if nameErr != nil {
+			return nil
+		}
+		relayRegistry := proxy.trustRegistry()
 		return func(network, addr string) (net.Conn, error) {
+			// Re-read the current snapshot per dial so newly established
+			// relay connections pick up reloads; already established
+			// connections keep the policy they were built with.
+			relaySnap := relayRegistry.Current()
 			ctx := &ProxyCtx{Req: &http.Request{}}
 			c, err := proxy.dial(ctx, network, u.Host)
 			if err != nil {
 				return nil, err
 			}
 
-			c, err = proxy.initializeTLSconnection(ctx, c, proxy.Tr.TLSClientConfig, u.Host)
+			c, err = proxy.initializeRelayTLS(ctx, c, u.Host, relayName, relaySnap, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -933,28 +957,56 @@ func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls
 	}
 }
 
-func (proxy *ProxyHttpServer) initializeTLSconnection(
+// initializeRelayTLS performs the independent TLS handshake to an encrypted
+// upstream relay over an already established raw connection. The relay hop
+// uses the relay's own normalized name as SNI and the relay's own trust
+// policy — the target name from the request is never used here, and the
+// shared transport TLS config is cloned rather than mutated. The target hop
+// later happens inside the tunnel with its own name and policy.
+func (proxy *ProxyHttpServer) initializeRelayTLS(
 	ctx *ProxyCtx,
-	targetConn net.Conn,
-	tlsConfig *tls.Config,
+	rawConn net.Conn,
 	addr string,
+	name upstreamtls.NormalizedName,
+	snap *upstreamtls.Snapshot,
+	policy *upstreamtls.TargetPolicy,
 ) (net.Conn, error) {
-	// Infer target ServerName, it's a copy of implementation inside tls.Dial()
-	if tlsConfig.ServerName == "" {
-		colonPos := strings.LastIndex(addr, ":")
-		if colonPos == -1 {
-			colonPos = len(addr)
-		}
-		hostname := addr[:colonPos]
-		// Make a copy to avoid polluting argument or default.
-		c := tlsConfig.Clone()
-		c.ServerName = hostname
-		tlsConfig = c
+	if policy == nil {
+		policy = proxy.effectiveMode(snap, name)
 	}
 
-	tlsConn := tls.Client(targetConn, tlsConfig)
-	if err := tlsConn.HandshakeContext(ctx.Req.Context()); err != nil {
+	baseCfg := proxy.Tr.TLSClientConfig
+	if baseCfg == nil {
+		baseCfg = &tls.Config{}
+	}
+	hop := upstreamtls.Hop{
+		Name:       name,
+		Snapshot:   snap,
+		Label:      "relay",
+		BaseConfig: baseCfg,
+	}
+	cfg, report, err := upstreamtls.ConfigForPolicy(hop, policy)
+	if err != nil {
+		_ = rawConn.Close()
 		return nil, err
 	}
+
+	tlsConn := tls.Client(rawConn, cfg)
+	if err := tlsConn.HandshakeContext(ctx.Req.Context()); err != nil {
+		_ = rawConn.Close()
+		return nil, upstreamtls.HandshakeError("relay", name, err)
+	}
+
+	if report.Skipped {
+		state := tlsConn.ConnectionState()
+		report.TLSVersion = state.Version
+		if len(state.PeerCertificates) > 0 {
+			report.PeerFingerprint = fingerprintLeaf(state.PeerCertificates[0])
+		}
+	}
+	if box := reportBoxFromCtx(ctx.Req.Context()); box != nil {
+		box.add(reportFromInternal(report))
+	}
+	_ = policy // effective mode is fully encoded in cfg via ConfigForHop
 	return tlsConn, nil
 }

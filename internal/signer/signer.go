@@ -1,3 +1,18 @@
+// Package signer creates short-lived leaf certificates for intercepted TLS
+// targets, signed by the proxy CA.
+//
+// Entropy for both the leaf key and the serial number is drawn from a
+// deterministic, CA-key-derived stream (CounterEncryptorRand), rather than the
+// process-global random source. The serial number is therefore reproducible
+// for a fixed (CA, hosts) pair.
+//
+// Reproducibility of the leaf private key additionally depends on the
+// platform: starting with Go 1.26, rsa/ecdsa/ed25519 key generation ignores a
+// caller-supplied entropy reader unless GODEBUG=cryptocustomrand=1 is set.
+// When that flag is not set, leaf keys are random even though serial numbers
+// stay deterministic. In all configurations the certificate cache guarantees
+// that within a process every handshake for a target reuses the single issued
+// certificate, which is what fingerprint and serial pinning observes.
 package signer
 
 import (
@@ -11,8 +26,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"io"
 	"math/big"
-	"math/rand"
 	"net"
 	"runtime"
 	"sort"
@@ -20,7 +35,7 @@ import (
 	"time"
 )
 
-const _goproxySignerVersion = ":goproxy2"
+const _goproxySignerVersion = ":goproxy3"
 
 func hashSorted(lst []string) []byte {
 	c := make([]string, len(lst))
@@ -45,13 +60,27 @@ func SignHost(ca tls.Certificate, hosts []string) (cert *tls.Certificate, err er
 	start := now.Add(-30 * 24 * time.Hour) // -30 days
 	end := now.Add(365 * 24 * time.Hour)   // 365 days
 
+	hash := hashSorted(append(hosts, _goproxySignerVersion, ":"+runtime.Version()))
+	var csprng CounterEncryptorRand
+	if csprng, err = NewCounterEncryptorRandFromKey(ca.PrivateKey, hash); err != nil {
+		return nil, err
+	}
+
+	// Derive the serial number from the same deterministic, key-derived
+	// stream used for the leaf key, instead of the global math/rand source.
+	// For a fixed (CA, hosts) pair the serial and the leaf key are therefore
+	// stable across calls, so repeated handshakes present an identical
+	// certificate to clients that pin the fingerprint or serial number.
 	// Always generate a positive int value
 	// (Two complement is not enabled when the first bit is 0)
-	generated := rand.Uint64()
-	generated >>= 1
+	serialBytes := make([]byte, 8)
+	if _, err = io.ReadFull(&csprng, serialBytes); err != nil {
+		return nil, err
+	}
+	serialBytes[0] &= 0x7f
 
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(int64(generated)),
+		SerialNumber: new(big.Int).SetBytes(serialBytes),
 		Issuer:       x509ca.Subject,
 		Subject: pkix.Name{
 			Organization: []string{"GoProxy untrusted MITM proxy Inc"},
@@ -70,12 +99,6 @@ func SignHost(ca tls.Certificate, hosts []string) (cert *tls.Certificate, err er
 			template.DNSNames = append(template.DNSNames, h)
 			template.Subject.CommonName = h
 		}
-	}
-
-	hash := hashSorted(append(hosts, _goproxySignerVersion, ":"+runtime.Version()))
-	var csprng CounterEncryptorRand
-	if csprng, err = NewCounterEncryptorRandFromKey(ca.PrivateKey, hash); err != nil {
-		return nil, err
 	}
 
 	var certpriv crypto.Signer

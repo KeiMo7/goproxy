@@ -904,7 +904,10 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxyWithHandler(
 // TLSConfigFromCA returns a TLSConfig function that generates dynamic TLS certificates
 // for each target host, signed by the given CA certificate.
 // The generated certificates are used during MITM interception (ConnectMitm).
-// If a CertStorage is set on the ProxyCtx, certificates are cached and reused to save CPU.
+// If the proxy's CertStore implements CertStorageV2 (e.g. *CertCache), concurrent
+// handshakes for the same target are coalesced into a single issuance and entries
+// are keyed by hostname, issuer, purpose and policy. A legacy CertStorage keeps its
+// original per-hostname behavior.
 func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls.Config, error) {
 	return func(host string, ctx *ProxyCtx) (*tls.Config, error) {
 		var err error
@@ -912,13 +915,29 @@ func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls
 
 		hostname := stripPort(host)
 		config := defaultTLSConfig.Clone()
-		ctx.Logf("signing for %s", stripPort(host))
+		ctx.Logf("signing for %s", hostname)
 
 		genCert := func() (*tls.Certificate, error) {
 			return signer.SignHost(*ca, []string{hostname})
 		}
 		if ctx.certStore != nil {
-			cert, err = ctx.certStore.Fetch(hostname, genCert)
+			if v2, ok := ctx.certStore.(CertStorageV2); ok {
+				issuerID, idErr := IssuerIDFromCertificate(ca)
+				if idErr != nil {
+					// A CA without a usable certificate cannot sign anything.
+					// Fail explicitly: never fall back to skipping verification.
+					ctx.Warnf("Cannot derive issuer identity from CA: %s", idErr)
+					return nil, idErr
+				}
+				cert, err = v2.FetchCert(CertRequest{
+					Host:     host,
+					IssuerID: issuerID,
+					Purpose:  CertPurposeServerTLS,
+					Generate: genCert,
+				})
+			} else {
+				cert, err = ctx.certStore.Fetch(hostname, genCert)
+			}
 		} else {
 			cert, err = genCert()
 		}

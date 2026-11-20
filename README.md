@@ -33,7 +33,47 @@ the proxy CA certificate, to avoid any certificate issue in the clients.
 - Perform certain actions only on `specific hosts`,  with a single equality comparison or with regex evaluation
 - Manipulate `requests` and `responses` before sending them to the browser
 - Use a `custom http.Transport` to perform requests to the target server
-- You can specify a `MITM certificates cache`, to reuse them later for other requests to the same host, thus saving CPU. Not enabled by default, but you should use it in production!
+- You can specify a `MITM certificates cache`, to reuse them later for other requests to the same host, thus saving CPU. Not enabled by default, but you should use it in production! The built-in `CertCache` coalesces concurrent handshakes, keys entries by host/issuer/purpose/policy, applies LRU and negative caching, and exposes hit/miss/discard counters.
+
+## MITM certificate cache
+
+Assign a `*goproxy.CertCache` to `proxy.CertStore` to enable the production
+certificate cache:
+
+```go
+proxy := goproxy.NewProxyHttpServer()
+proxy.CertStore = goproxy.NewCertCache(
+    goproxy.WithMaxEntries(4096),
+    goproxy.WithNegativeTTL(2 * time.Second),
+)
+```
+
+Guarantees:
+
+- Concurrent handshakes for the same target trigger a single signing; the
+  other waiters share the resulting certificate or the same error. The leader
+  finishing its own request early never cancels the in-flight signing.
+- Cache keys distinguish the normalized hostname (case-folded, trailing dot
+  and port stripped), the signing issuer, a purpose tag and an opaque policy
+  tag, with length-prefixed serialization that cannot collide.
+- Rotating the CA supersedes the previous issuer's entry, so an old
+  certificate is never served again; corrupt or unparsable leaves are
+  discarded and re-signed.
+- Capacity is bounded with LRU eviction; failed signings are held in a
+  negative cache with exponential backoff, so a failing target cannot pin the
+  CPU. Internal faults fall back to rate-limited on-demand signing.
+- Returned certificates are independent copies, so one connection cannot
+  mutate a shared entry. Aggregate counters are available via `Stats()` and
+  per-host counters via `TargetStats(host)`.
+- With no cache configured, every handshake signs independently exactly as
+  before. The legacy `CertStorage` interface (`Fetch(hostname, gen)`) keeps
+  working for existing custom implementations.
+
+Leaf serial numbers are derived from a deterministic, CA-key-derived entropy
+stream. Full leaf-key reproducibility additionally requires
+`GODEBUG=cryptocustomrand=1` on Go 1.26+, where key generation otherwise
+ignores a custom random source; within a process the cache still guarantees a
+single stable certificate per target regardless.
 - Redirect normal HTTP traffic to a `custom handler`, when the target is a `relative path` (e.g. `/ping`)
 - You can choose the logger to use, by implementing the `Logger` interface
 - You can `disable` the HTTP request headers `canonicalization`, by setting `PreventCanonicalization` to true

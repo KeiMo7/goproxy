@@ -2,11 +2,13 @@ package signer_test
 
 import (
 	"context"
+	"crypto"
 	"crypto/tls"
 	"crypto/x509"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -81,6 +83,61 @@ func TestSignerRsaTls(t *testing.T) {
 
 func TestSignerRsaX509(t *testing.T) {
 	testSignerX509(t, goproxy.GoproxyCa)
+}
+
+// TestSignHostSerialDeterministic locks the contract that the serial number
+// is derived from the CA-derived CSPRNG rather than the global random source,
+// so it is stable for a fixed (CA, hosts) pair and distinct across hosts.
+//
+// Full leaf-key determinism additionally requires GODEBUG=cryptocustomrand=1:
+// since Go 1.26, rsa/ecdsa/ed25519 key generation ignores a custom entropy
+// reader by default. The cert cache still guarantees that within a process
+// every handshake for a target reuses the one issued certificate, which is
+// what fingerprint pinning actually observes. See TestSignHostFullyDeterministic
+// for the GODEBUG-enabled path.
+func TestSignHostSerialDeterministic(t *testing.T) {
+	for name, ca := range map[string]tls.Certificate{"rsa": goproxy.GoproxyCa, "ecdsa": EcdsaCa} {
+		t.Run(name, func(t *testing.T) {
+			first, err := signer.SignHost(ca, []string{"deterministic.example"})
+			orFatal(t, "first SignHost", err)
+			second, err := signer.SignHost(ca, []string{"deterministic.example"})
+			orFatal(t, "second SignHost", err)
+			if first.Leaf.SerialNumber.Cmp(second.Leaf.SerialNumber) != 0 {
+				t.Fatalf("%s serial differs: %v vs %v", name,
+					first.Leaf.SerialNumber, second.Leaf.SerialNumber)
+			}
+			if first.Leaf.Subject.CommonName != "deterministic.example" {
+				t.Fatalf("unexpected CN: %q", first.Leaf.Subject.CommonName)
+			}
+			other, err := signer.SignHost(ca, []string{"other.example"})
+			orFatal(t, "other SignHost", err)
+			if other.Leaf.SerialNumber.Cmp(first.Leaf.SerialNumber) == 0 {
+				t.Fatal("distinct hosts produced the same serial number")
+			}
+		})
+	}
+}
+
+// TestSignHostFullyDeterministic runs only when the platform honors a custom
+// entropy reader (GODEBUG=cryptocustomrand=1), asserting both the serial and
+// the leaf key are reproducible for a fixed (CA, hosts) pair.
+func TestSignHostFullyDeterministic(t *testing.T) {
+	if os.Getenv("GODEBUG_DETERMINISTIC") != "1" {
+		t.Skip("set GODEBUG_DETERMINISTIC=1 together with GODEBUG=cryptocustomrand=1 to run")
+	}
+	ca := goproxy.GoproxyCa
+	first, err := signer.SignHost(ca, []string{"deterministic.example"})
+	orFatal(t, "first SignHost", err)
+	second, err := signer.SignHost(ca, []string{"deterministic.example"})
+	orFatal(t, "second SignHost", err)
+	if first.Leaf.SerialNumber.Cmp(second.Leaf.SerialNumber) != 0 {
+		t.Fatalf("serial differs: %v vs %v",
+			first.Leaf.SerialNumber, second.Leaf.SerialNumber)
+	}
+	if !first.Leaf.PublicKey.(interface{ Equal(x crypto.PublicKey) bool }).
+		Equal(second.Leaf.PublicKey) {
+		t.Fatal("leaf public key differs despite cryptocustomrand=1")
+	}
 }
 
 func TestSignerEcdsaTls(t *testing.T) {

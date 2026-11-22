@@ -187,6 +187,10 @@ func (c *readBufferedConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
+// NetConn returns the underlying connection. It lets the client-disconnect
+// probe reach the socket's descriptor through this wrapper.
+func (c *readBufferedConn) NetConn() net.Conn { return c.Conn }
+
 // ConnectAction enables the caller to override the standard connect flow.
 // When Action is ConnectHijack, it is up to the implementer to send the
 // HTTP 200, or any other valid http response back to the client from within the
@@ -221,15 +225,18 @@ func (proxy *ProxyHttpServer) dial(ctx *ProxyCtx, network, addr string) (c net.C
 }
 
 func (proxy *ProxyHttpServer) connectDial(ctx *ProxyCtx, network, addr string) (c net.Conn, err error) {
-	if proxy.ConnectDialWithReq == nil && proxy.ConnectDial == nil {
-		return proxy.dial(ctx, network, addr)
-	}
-
 	if proxy.ConnectDialWithReq != nil {
 		return proxy.ConnectDialWithReq(ctx.Req, network, addr)
 	}
-
-	return proxy.ConnectDial(network, addr)
+	if proxy.ConnectDial != nil && !proxy.dialFromEnv {
+		return proxy.ConnectDial(network, addr)
+	}
+	// No caller-supplied dialer: route the tunnel through the shared
+	// upstream budget so it counts against the same limits as forwarded
+	// requests and is subject to the tunnel connect timeout. When a dialer
+	// was derived from HTTPS_PROXY, tunnels are dialed through it under the
+	// same budget instead of bypassing the limits.
+	return proxy.upstreamTunnelDial(ctx, network, addr)
 }
 
 type halfClosable interface {
@@ -591,6 +598,15 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					req = req.WithContext(requestContext)
 					defer finishRequest()
 
+					// Observe the connection's read side while this request is
+					// being forwarded. When the client disconnects, the pending
+					// read fails; canceling the request context then propagates
+					// the disconnect into the upstream RoundTrip and response
+					// body. The watcher is stopped before the next request, so a
+					// keep-alive connection is unaffected.
+					stopDisconnectWatch := watchClientDisconnect(client, finishRequest)
+					defer stopDisconnectWatch()
+
 					// explicitly discard request body to avoid data races in certain RoundTripper implementations
 					// see https://github.com/golang/go/issues/61596#issuecomment-1652345131
 					defer req.Body.Close()
@@ -744,6 +760,49 @@ func httpError(w io.Writer, ctx *ProxyCtx, err error) {
 		if err := c.Close(); err != nil {
 			ctx.Warnf("Error closing client connection: %s", err)
 		}
+	}
+}
+
+// watchClientDisconnect arranges for cancel to run when the client side of a
+// hijacked MITM connection is closed. A hijacked connection has no net/http
+// server watching it for disconnects, so without this an upstream request
+// whose client vanished would keep running until its own timeout. The watch
+// only inspects end-of-file state: it never consumes payload bytes, so the
+// MITM request loop keeps reading requests from the same connection as usual.
+//
+// On platforms where a non-destructive liveness probe is unavailable the
+// watch is a no-op; the request still ends when writing the response fails.
+func watchClientDisconnect(conn net.Conn, cancel context.CancelFunc) func() {
+	probe := newReadableProbe(unwrapConn(conn))
+	if probe == nil {
+		return func() {}
+	}
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		t := time.NewTicker(20 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if probe.PeerGone() {
+					select {
+					case <-done:
+					default:
+						cancel()
+					}
+					return
+				}
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		<-stopped
+		releaseProbe(probe)
 	}
 }
 

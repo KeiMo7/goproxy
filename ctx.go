@@ -44,11 +44,15 @@ func (f RoundTripperFunc) RoundTrip(req *http.Request, ctx *ProxyCtx) (*http.Res
 	return f(req, ctx)
 }
 
+// RoundTrip forwards req to its destination. A per-request RoundTripper
+// takes precedence; otherwise the request goes through the proxy's upstream
+// pool, which reuses connections, enforces the configured limits and applies
+// the layered upstream timeouts.
 func (ctx *ProxyCtx) RoundTrip(req *http.Request) (*http.Response, error) {
 	if ctx.RoundTripper != nil {
 		return ctx.RoundTripper.RoundTrip(req, ctx)
 	}
-	return ctx.Proxy.Tr.RoundTrip(req)
+	return ctx.Proxy.roundTripUpstream(ctx, req)
 }
 
 func (ctx *ProxyCtx) printf(msg string, argv ...any) {

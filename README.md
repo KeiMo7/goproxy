@@ -37,6 +37,7 @@ the proxy CA certificate, to avoid any certificate issue in the clients.
 - Redirect normal HTTP traffic to a `custom handler`, when the target is a `relative path` (e.g. `/ping`)
 - You can choose the logger to use, by implementing the `Logger` interface
 - You can `disable` the HTTP request headers `canonicalization`, by setting `PreventCanonicalization` to true
+- Upstream connections to origins are `reused` and `bounded`, with layered connect/TLS/response-header/idle timeouts, idle reclamation and end-to-end cancellation. See [UPSTREAM.md](UPSTREAM.md) and `ProxyHttpServer.Upstream`
 
 ## Proxy modes
 1. Regular HTTP proxy

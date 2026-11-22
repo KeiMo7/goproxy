@@ -6,7 +6,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 
+	"github.com/elazarl/goproxy/internal/upstream"
 	"golang.org/x/net/http2"
 )
 
@@ -42,6 +44,11 @@ type ProxyHttpServer struct {
 	// ConnectDial will be used to create TCP connections for CONNECT requests
 	// if nil Tr.Dial will be used
 	ConnectDial func(network string, addr string) (net.Conn, error)
+	// dialFromEnv records that ConnectDial was installed by
+	// NewProxyHttpServer from the HTTPS_PROXY environment variable rather
+	// than by the caller. Tunnels through such a dialer still go through
+	// the shared upstream budget; a caller-supplied dialer is used as is.
+	dialFromEnv bool
 	// ConnectDialWithReq is like ConnectDial but also receives the original CONNECT request,
 	// allowing dial decisions based on request headers (e.g. target host, auth tokens).
 	// When both ConnectDialWithReq and ConnectDial are set, ConnectDialWithReq takes precedence.
@@ -72,6 +79,17 @@ type ProxyHttpServer struct {
 	// h2Server is the HTTP/2 server instance used for MITM.
 	// It is shared across all connections.
 	h2Server *http2.Server
+	// Upstream configures connection reuse, resource limits and the layered
+	// upstream timeouts for plain forwarding and CONNECT tunnelling. Nil
+	// selects the package defaults.
+	Upstream *UpstreamConfig
+
+	// upstreamMu guards the derived manager, which is rebuilt whenever Tr
+	// or Upstream changes.
+	upstreamMu  sync.Mutex
+	upstreamMgr *upstream.Manager
+	upstreamTr  *http.Transport
+	upstreamCfg *UpstreamConfig
 }
 
 func hasPort(s string) bool {
@@ -176,6 +194,9 @@ func NewProxyHttpServer() *ProxyHttpServer {
 		Tr:       &http.Transport{TLSClientConfig: tlsClientSkipVerify, Proxy: http.ProxyFromEnvironment},
 		h2Server: &http2.Server{},
 	}
-	proxy.ConnectDial = dialerFromEnv(&proxy)
+	if d := dialerFromEnv(&proxy); d != nil {
+		proxy.ConnectDial = d
+		proxy.dialFromEnv = true
+	}
 	return &proxy
 }
